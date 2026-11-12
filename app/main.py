@@ -1,4 +1,4 @@
-"""FastAPI application for finding parcels with insufficient cloud-free coverage."""
+"""FastAPI application for parcel coverage analysis and boundary correction."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.analysis import (
@@ -17,13 +18,21 @@ from app.analysis import (
     analyze_coverage,
     validate_uploads,
 )
+from app.boundaries import (
+    BoundaryError,
+    apply_correction,
+    build_plan,
+    inspect_parcel_raster,
+    parse_geojson,
+)
 
 app = FastAPI(
     title="农情遥感补采分析 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "上传一张地块编号图和任一数量的单波段无云掩膜，统计每个地块的"
-        "总像元数与至少一景无云覆盖的像元数，并返回覆盖率低于目标值的地块。"
+        "总像元数与至少一景无云覆盖的像元数，并返回覆盖率低于目标值的地块；"
+        "也可用复测得到的 WGS84 多边形边界批量更正地块编号图。"
     ),
 )
 
@@ -179,3 +188,82 @@ def analyze(
             for r in below
         ],
     )
+
+
+def _boundary_error_response(error: BoundaryError) -> HTTPException:
+    # Structural errors carry their own detail; batch errors wrap the full
+    # list of parcel-level problems, which we flatten (without duplicating).
+    if error.related:
+        details = [e.as_dict() for e in error.related]
+    else:
+        details = [error.as_dict()]
+    return HTTPException(
+        status_code=400,
+        detail={
+            "message": "边界更正核对未通过，未输出影像。",
+            "errors": details,
+        },
+    )
+
+
+@app.post(
+    "/correct-boundaries",
+    tags=["边界更正"],
+    summary="按复测多边形批量更正地块编号图",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"image/tiff": {}}, "description": "更正后的地块编号图 GeoTIFF"},
+        400: {"description": "批次核对未通过，响应中列出全部编号级错误与冲突像元行列号"},
+    },
+)
+def correct_boundaries(
+    background: BackgroundTasks,
+    parcel: Annotated[
+        UploadFile,
+        File(
+            description=(
+                "原地块编号图：北向上、单波段 UInt16/UInt32 GeoTIFF，NoData 为 0"
+            )
+        ),
+    ],
+    boundaries: Annotated[
+        UploadFile,
+        File(
+            description=(
+                "WGS84 GeoJSON（FeatureCollection），每个原地块编号对应一个 Polygon，"
+                "编号取自 properties.parcel_id（或数字 Feature id），最多 32 个"
+            )
+        ),
+    ],
+) -> FileResponse:
+    with tempfile.TemporaryDirectory(prefix="agri-boundaries-") as tmp:
+        tmp_dir = Path(tmp)
+        parcel_name = _safe_upload_name(parcel, 0)
+        parcel_dest = tmp_dir / "parcel.tif"
+        _save_upload(parcel, parcel_dest)
+        geojson_dest = tmp_dir / "boundaries.geojson"
+        _save_upload(boundaries, geojson_dest)
+
+        upload = UploadedRaster(
+            path=str(parcel_dest), filename=parcel_name, role="parcel"
+        )
+        try:
+            meta = inspect_parcel_raster(upload)
+            parcels = parse_geojson(geojson_dest.read_bytes(), meta)
+            plan = build_plan(meta, parcels)
+            output_path = tmp_dir / "parcel_corrected.tif"
+            apply_correction(plan, str(output_path))
+        except BoundaryError as exc:
+            raise _boundary_error_response(exc) from exc
+
+        # Copy the finished image out of the temporary directory, then schedule
+        # the working directory for deletion once the response has been sent.
+        keep_dir = Path(tempfile.mkdtemp(prefix="agri-boundaries-out-"))
+        keep_path = keep_dir / "parcel_corrected.tif"
+        shutil.move(str(output_path), keep_path)
+        background.add_task(shutil.rmtree, keep_dir, ignore_errors=True)
+        return FileResponse(
+            keep_path,
+            media_type="image/tiff",
+            filename="parcel_corrected.tif",
+        )
