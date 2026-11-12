@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.analysis import (
@@ -16,6 +17,12 @@ from app.analysis import (
     UploadedRaster,
     analyze_coverage,
     validate_uploads,
+)
+from app.boundaries import (
+    BoundaryError,
+    apply_boundary_updates,
+    open_parcel_raster,
+    parse_boundary_geojson,
 )
 
 app = FastAPI(
@@ -178,4 +185,61 @@ def analyze(
             )
             for r in below
         ],
+    )
+
+
+@app.post(
+    "/update-parcel-boundaries",
+    tags=["边界更正"],
+    summary="按复测 GeoJSON 批量更正地块编号图边界",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"image/tiff": {}}, "description": "更正后的地块编号图 GeoTIFF"},
+        400: {"description": "整批核对未通过，不生成影像；detail 中列出编号、冲突像元行列号等"},
+    },
+)
+def update_parcel_boundaries(
+    background_tasks: BackgroundTasks,
+    parcel: Annotated[
+        UploadFile,
+        File(
+            description=(
+                "底图地块编号图：北向上的单波段 UInt16/UInt32 GeoTIFF，NoData 为 0"
+            )
+        ),
+    ],
+    boundaries: Annotated[
+        UploadFile,
+        File(
+            description=(
+                "WGS84 GeoJSON（FeatureCollection）：每个原地块编号对应一个 Polygon，"
+                "编号取 properties.parcel_id（或要素 id），最多 32 个要素"
+            )
+        ),
+    ],
+) -> FileResponse:
+    temp_root = Path(tempfile.mkdtemp(prefix="agri-boundaries-"))
+    background_tasks.add_task(shutil.rmtree, temp_root, ignore_errors=True)
+
+    # Fixed names: an upload filename must never collide with another field
+    # or be used as a path component.
+    parcel_name = _safe_upload_name(parcel, 0)
+    parcel_dest = temp_root / "parcel_map.tif"
+    _save_upload(parcel, parcel_dest)
+
+    geojson_dest = temp_root / "boundaries.geojson"
+    _save_upload(boundaries, geojson_dest)
+
+    try:
+        spec = open_parcel_raster(str(parcel_dest))
+        updates = parse_boundary_geojson(geojson_dest.read_bytes(), spec)
+        output_path = temp_root / "parcel_map_updated.tif"
+        apply_boundary_updates(spec, updates, str(output_path))
+    except BoundaryError as exc:
+        raise HTTPException(status_code=400, detail=exc.as_detail()) from exc
+
+    return FileResponse(
+        output_path,
+        media_type="image/tiff",
+        filename=f"{Path(parcel_name).stem}_updated.tif",
     )

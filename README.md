@@ -91,6 +91,7 @@ APP_PORT=8080 docker compose up --build -d
 - `samples/parcel_map.tif`：120×100，EPSG:32650，像元 10 m，地块编号 101–104
 - `samples/scene_01_cloud_free.tif`：相对地块图原点偏移 `(-7, -5)` 像元
 - `samples/scene_02_cloud_free.tif`：相对地块图原点偏移 `(+15, +10)` 像元
+- `samples/boundary_update_sample.geojson`：WGS84 边界更正样例，互改 101/102 两块地
 
 两景的幅面尺寸不同、原点错开且空间范围互相重叠，像元格网与地块图对齐，
 用于验证窗口映射和多景覆盖合并。
@@ -114,6 +115,69 @@ curl -X POST http://localhost:8000/analyze \
 python scripts/generate_samples.py
 ```
 
+### `POST /update-parcel-boundaries`
+
+县里复测后，用新的地块边界批量更正地块编号图。以 `multipart/form-data` 上传：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `parcel` | 文件，单个 | 底图地块编号图：北向上的单波段 UInt16/UInt32 GeoTIFF，NoData 为 0 |
+| `boundaries` | 文件，单个 | WGS84（EPSG:4326）GeoJSON，FeatureCollection；每个原地块编号对应一个 Polygon，最多 32 个要素 |
+
+GeoJSON 要素的地块编号取 `properties.parcel_id`（也兼容要素顶层 `id`），
+必须是图上已存在的正整数。边界会从 WGS84 重投影到底图坐标系，
+**像元中心落在多边形内或边上都算命中**（边的判定带 1e-6 像元容差）。
+
+更正规则：
+
+- 本批地块的旧像元视为可复用资源，新边界可以占用同批其他地块的旧址；
+  未被任何新边界命中的旧像元置 0。
+- 不在本批中的地块像元保持不变。
+- 两个新边界命中同一像元（`new_new` 冲突），或新边界占用了未更正地块
+  的像元（`new_old` 冲突），都会在错误中给出两个编号和一个冲突像元的
+  行列号（从 0 开始）。
+- 旧编号在图上不存在，或某条新边界在图内没有命中任何像元，也会分别
+  在 `unknown_parcel_ids`、`no_hit_parcel_ids` 中指出编号。
+- **有错不出图**：任一校验不通过都返回 HTTP 400，不写出任何像元。
+- 整批核对通过后才分块写出新 GeoTIFF，保留原图的尺寸、坐标系、格网、
+  数据类型和 NoData，成功时以 `image/tiff` 下载返回。
+
+错误响应示例：
+
+```json
+{
+  "detail": {
+    "message": "边界核对未通过，未生成新的地块编号图。",
+    "geojson_errors": [],
+    "unknown_parcel_ids": [99],
+    "no_hit_parcel_ids": [],
+    "conflicts": [
+      {
+        "type": "new_new",
+        "parcel_ids": [101, 102],
+        "row": 12,
+        "column": 57
+      }
+    ]
+  }
+}
+```
+
+随附样例 `samples/boundary_update_sample.geojson` 同时更正地块 101、102，
+两条新边界各呈 L 形、互占对方一条旧址且互不重叠（生成脚本：
+`scripts/generate_boundary_sample.py`）。Swagger 上传示例：
+
+```bash
+curl -X POST http://localhost:8000/update-parcel-boundaries \
+  -F "parcel=@samples/parcel_map.tif" \
+  -F "boundaries=@samples/boundary_update_sample.geojson" \
+  --output parcel_map_updated.tif
+```
+
+更正后：101 共 2100 个像元、102 共 2300 个像元，各自有 100 个像元落在
+对方旧址上；103、104 及行间空隙保持不变。把返回的图再传给 `/analyze`
+即可直接用于补采分析。
+
 本地运行与测试（可选）：
 
 ```bash
@@ -125,9 +189,11 @@ pytest -q
 ## 计算与内存
 
 - 以地块图为基准，按其自身分块遍历；异常大的条带/分块会再切到
-  ≤1024×1024 像元的窗口（`app.analysis`）。不会整幅载入地块图或掩膜。
+  ≤1024×1024 像元的窗口（`app.analysis`、`app.boundaries`）。不会整幅载入地块图或掩膜。
 - 每个窗口只读取与地块窗口相交的掩膜窗口。越界部分按未覆盖处理。
 - 每个地块的总像元数和覆盖像元数按窗口增量累计，多景掩膜用布尔 OR 合并，
   重叠不重复计数。
+- 边界更正分两遍走块：第一遍只做命中核对并汇总全部错误，第二遍才向新文件
+  写像元；每块内先用栅格化缩小候选像元，再逐候选点做精确的像元中心判定。
 - 上传文件先保存到私有临时目录，请求结束后自动删除；不使用上传文件名作为
   本地路径。
